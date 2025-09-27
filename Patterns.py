@@ -1,15 +1,14 @@
 """
-Memory-efficient Keltner Channel optimizer with full historical data for droplets
+Memory-efficient Keltner Channel optimizer with aggregated CSV and multiple equity graphs
 
-Features:
-- 4h timeframe with full history
-- Grid search over EMA lengths, ATR lengths, multipliers
-- Entry: close above upper band
-- Exit: close below mean band OR 5% stoploss
-- Processes one symbol at a time to save memory
-- Metrics: CAGR, Sharpe, Sortino, Calmar, max DD, win rate, profit factor
-- Only top 10 combos per symbol by profit factor are plotted
-- Headless Matplotlib for droplets
+- Shows progress while downloading OHLCV bars per symbol
+- Processes one symbol at a time
+- Aggregates metrics across symbols (numeric only, avoids column duplication)
+- Generates CSV including profit factor
+- Plots top 5 equity curves by Sortino ratio and top 5 by total return
+- Prevents crashes on small droplets by clearing memory and forcing garbage collection
+- Ensures rolling windows are integers
+- Console waits for Enter to exit
 """
 
 import matplotlib
@@ -19,21 +18,30 @@ import ccxt
 import pandas as pd
 import numpy as np
 from itertools import product
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import os
+import gc
 
 # --------------------------- CONFIG ---------------------------
-SYMBOLS = ['BTC/USDT', 'ETH/USDT']
+SYMBOLS = [ "HMSTRUSDT","BBUSDT","ACTUSDT","HOOKUSDT","SXTUSDT","FLOWUSDT","MUBARAKUSDT","DEXEUSDT",
+    "1000CATUSDT","THETAUSDT","COOKIEUSDT","AVAXUSDT","LQTYUSDT","EPICUSDT","ACXUSDT","CTSIUSDT",
+    "GMTUSDT","QNTUSDT","ARKUSDT","ONGUSDT","WIFUSDT","CYBERUSDT","PORTALUSDT","FIDAUSDT",
+    "PIXELUSDT","NEXOUSDT","FORMUSDT","CUSDT","BANANAUSDT","KNCUSDT","LRCUSDT","JASMYUSDT",
+    "XAIUSDT","EGLDUSDT","TOWNSUSDT","ILVUSDT","DODOUSDT","QIUSDT","HOLOUSDT","EDUUSDT",
+    "VELODROMEUSDT","INITUSDT","MANTAUSDT","BICOUSDT","OPENUSDT","BEAMXUSDT","C98USDT","RDNTUSDT",
+    "OXTUSDT","ACEUSDT","PHAUSDT","SKLUSDT","AIXBTUSDT","HYPERUSDT","KAIAUSDT","DOTUSDT","FTTUSDT",
+    "ZECUSDT","BONKUSDT","NEARUSDT","PYTHUSDT","PHBUSDT","TNSRUSDT","SFPUSDT","AXLUSDT","AEVOUSDT",
+    ]
 TIMEFRAME = '4h'
 EMA_LENGTHS = [30, 60, 90, 120]
 ATR_LENGTHS = [30, 60, 90, 120]
 MULTIPLIERS = [x * 0.5 for x in range(2, 7)]
 INITIAL_CAPITAL = 10000.0
-COMMISSION = 0.00075
+COMMISSION = 0.001
 SLIPPAGE_PCT = 0.0005
 STOPLOSS_PCT = 0.05
 MIN_BARS = 200
-TOP_N_PLOT = 10
+TOP_N_PLOT = 5
 OUTPUT_DIR = 'keltner_optimizer_out'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -44,14 +52,18 @@ def fetch_ohlcv(symbol, timeframe, start_date='2022-01-01'):
     since_ms = int(pd.to_datetime(start_date).timestamp() * 1000)
     all_bars = []
     limit = 1000
+    print(f'Fetching data for {symbol}...')
+    pbar = tqdm(desc=f'{symbol} OHLCV', unit='bars')
     while True:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
         if not bars:
             break
         all_bars += bars
         since_ms = bars[-1][0] + 1
+        pbar.update(len(bars))
         if len(bars) < limit:
             break
+    pbar.close()
     df = pd.DataFrame(all_bars, columns=['timestamp','open','high','low','close','volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('datetime', inplace=True)
@@ -59,11 +71,12 @@ def fetch_ohlcv(symbol, timeframe, start_date='2022-01-01'):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-
 def ema(series, length):
+    length = int(length)
     return series.ewm(span=length, adjust=False).mean()
 
 def atr(df, length):
+    length = int(length)
     high, low, close = df['high'], df['low'], df['close']
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean()
@@ -148,10 +161,13 @@ def backtest(df, signals, return_equity_curve=False):
 
 
 def run_grid():
-    for symbol in SYMBOLS:
-        print(f'Fetching {symbol}...')
-        df = fetch_ohlcv(symbol, TIMEFRAME)
-        results = []
+    all_results = []
+
+    # Fetch all symbols once with progress bars
+    data_dict = {symbol: fetch_ohlcv(symbol, TIMEFRAME) for symbol in SYMBOLS}
+
+    # Grid search per symbol
+    for symbol, df in data_dict.items():
         combos = list(product(EMA_LENGTHS, ATR_LENGTHS, MULTIPLIERS))
         for ema_len, atr_len, mult in tqdm(combos, desc=f'Grid {symbol}'):
             if len(df) < max(ema_len, atr_len)+MIN_BARS:
@@ -161,30 +177,24 @@ def run_grid():
             metrics = backtest(df_kc, signals, return_equity_curve=False)
             row = {'symbol': symbol, 'ema_len': ema_len, 'atr_len': atr_len, 'multiplier': mult}
             row.update(metrics)
-            results.append(row)
-            del df_kc, signals  # free memory
-        df_results = pd.DataFrame(results)
-        df_results.to_csv(os.path.join(OUTPUT_DIR,f'results_{symbol.replace("/","_")}.csv'), index=False)
+            all_results.append(row)
 
-        # plot top N by profit factor
-        topN = df_results.sort_values('profit_factor', ascending=False).head(TOP_N_PLOT)
-        plt.figure(figsize=(12,8))
-        for _, row in topN.iterrows():
-            df_kc = compute_keltner(df, row.ema_len, row.atr_len, row.multiplier)
-            signals = generate_signals(df_kc)
-            eq_curve, _ = backtest(df_kc, signals, return_equity_curve=True)
-            plt.plot(eq_curve.index, eq_curve.values/eq_curve.iloc[0], label=f"EMA{row.ema_len}_ATR{row.atr_len}_M{row.multiplier}")
-            del df_kc, signals, eq_curve
-        plt.title(f'Top {TOP_N_PLOT} Equity Curves for {symbol}')
-        plt.xlabel('Date')
-        plt.ylabel('Normalized Equity')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR,f'top{TOP_N_PLOT}_equity_{symbol.replace("/","_")}.png'), dpi=150)
-        plt.close()
+            # Clean up
+            del df_kc, signals, metrics
+            gc.collect()
 
+    df_all = pd.DataFrame(all_results)
 
-if __name__ == '__main__':
-    run_grid()
-    print('Done.')
+    # Aggregate only numeric metrics and avoid duplicating groupby columns
+    group_cols = ['ema_len','atr_len','multiplier']
+    numeric_cols = df_all.select_dtypes(include=[np.number]).columns.difference(group_cols)
+    df_agg = df_all.groupby(group_cols)[numeric_cols].mean().reset_index()
+    df_agg.to_csv(os.path.join(OUTPUT_DIR,'results_aggregated.csv'), index=False)
+
+    df_first = data_dict[SYMBOLS[0]]
+
+    # Top 5 by Sortino ratio
+    top_sortino = df_agg.sort_values('sortino', ascending=False).head(TOP_N_PLOT)
+    plt.figure(figsize=(12,8))
+    for _, row in top_sortino.iterrows():
+        df_kc = compute_keltner(df_first, row.
