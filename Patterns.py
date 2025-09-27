@@ -1,20 +1,20 @@
 """
-Memory-efficient Keltner Channel strategy optimizer for Binance droplets
+Memory-efficient Keltner Channel strategy optimizer with safe data fetching for Binance droplets
 
 Features:
-- 4h timeframe
+- Fetches OHLCV in chunks with local CSV caching
+- 4h timeframe (can be changed)
 - Grid search over EMA lengths, ATR lengths, multipliers
 - Entry: close above upper band
 - Exit: close below mean band OR 5% stoploss
 - Multi-symbol support
-- Risk and performance metrics: CAGR, Sharpe, Sortino, Calmar, max DD, win rate, profit factor
-- CSV outputs per symbol and aggregated
-- Single PNG with equity curves of top 10 combos by profit factor
+- Metrics: CAGR, Sharpe, Sortino, Calmar, max DD, win rate, profit factor
+- Only top 10 combos by profit factor are plotted
 - Headless Matplotlib for droplets
 """
 
 import matplotlib
-matplotlib.use('Agg')  # headless backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import ccxt
 import pandas as pd
@@ -22,16 +22,17 @@ import numpy as np
 from itertools import product
 from tqdm import tqdm
 import os
+import time
 
 # --------------------------- CONFIG ---------------------------
 SYMBOLS = ['BTC/USDT', 'ETH/USDT']
 TIMEFRAME = '4h'
-START_DATE = '2023-01-01'  # reduced data range for memory efficiency
+LOOKBACK_DAYS = 365  # fetch only last 1 year to save memory
 EMA_LENGTHS = [30, 60, 90, 120]
 ATR_LENGTHS = [30, 60, 90, 120]
 MULTIPLIERS = [x * 0.5 for x in range(2, 7)]
 INITIAL_CAPITAL = 10000.0
-COMMISSION = 0.00075
+COMMISSION = 0.001
 SLIPPAGE_PCT = 0.0005
 STOPLOSS_PCT = 0.05
 MIN_BARS = 200
@@ -40,24 +41,47 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------------------- HELPERS ---------------------------
 
-def fetch_ohlcv(symbol, timeframe, since_iso):
+def fetch_ohlcv(symbol, timeframe, lookback_days=LOOKBACK_DAYS):
     exchange = ccxt.binance({'enableRateLimit': True})
+    since_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+    symbol_file = f'{OUTPUT_DIR}/{symbol.replace("/","_")}_ohlcv.csv'
+
+    if os.path.exists(symbol_file):
+        df = pd.read_csv(symbol_file, index_col='datetime', parse_dates=True)
+        print(f'Loaded cached data for {symbol} from {symbol_file}')
+        return df
+
+    print(f'Fetching {symbol} OHLCV from Binance...')
     since_ms = int(pd.to_datetime(since_iso).timestamp() * 1000)
     all_bars = []
     limit = 1000
     while True:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        try:
+            bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        except ccxt.NetworkError as e:
+            print(f'Network error: {e}, retrying in 5s...')
+            time.sleep(5)
+            continue
         if not bars:
             break
         all_bars += bars
         since_ms = bars[-1][0] + 1
         if len(bars) < limit:
             break
+        time.sleep(0.2)  # avoid rate limit
+
     df = pd.DataFrame(all_bars, columns=['timestamp','open','high','low','close','volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('datetime', inplace=True)
+    df = df[['open','high','low','close','volume']]
     df = df[~df.index.duplicated(keep='first')]
+    df.to_csv(symbol_file)
+    print(f'Saved fetched data for {symbol} to {symbol_file}')
     return df
+
+# EMA, ATR, compute_keltner, generate_signals, backtest remain the same as previous memory-efficient version
+# run_grid and plot_top10 functions remain the same, using fetch_ohlcv with caching and LOOKBACK_DAYS limit
+
 
 
 def ema(series, length):
