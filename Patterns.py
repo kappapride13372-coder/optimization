@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_complete_occurrences.py
-Fetch OHLC from Binance with progress bars, classify 4-bar windows,
+four_bar_patterns_incremental.py
+Fetch OHLC from Binance, classify 4-bar windows,
 compute average forward returns (6,12,18,24 bars), profit factor,
-count occurrences, filter patterns with at least 300 occurrences, 
-and save a CSV with all info.
+count occurrences, filter patterns >=300 times, and write results incrementally to CSV.
+Safe for low-RAM droplets.
 """
 
 import pandas as pd
@@ -15,11 +15,12 @@ import aiohttp
 from datetime import datetime, timedelta, timezone
 from tqdm import tqdm
 import math
+import os
 
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 # -----------------------------
-# Fetch a chunk of klines safely
+# Fetch OHLC chunk safely
 # -----------------------------
 async def fetch_klines(session, symbol, interval, start_str, limit=1000, retries=3):
     params = {
@@ -39,7 +40,7 @@ async def fetch_klines(session, symbol, interval, start_str, limit=1000, retries
     return []
 
 # -----------------------------
-# Fetch full historical OHLC with progress bar
+# Get historical OHLC for one symbol
 # -----------------------------
 async def get_historical_ohlc(symbol, interval='1h', years=4):
     end_time = datetime.now(timezone.utc)
@@ -69,12 +70,13 @@ async def get_historical_ohlc(symbol, interval='1h', years=4):
     ])
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-    numeric_cols = ['open','high','low','close','volume']
-    df[numeric_cols] = df[numeric_cols].astype(float)
+    # Keep only essential columns
+    df = df[['open','high','low','close']]
+    df = df.astype(float)
     return df
 
 # -----------------------------
-# Categorize 4-bar adjacent patterns
+# Classify 4-bar adjacent patterns
 # -----------------------------
 def get_4bar_adjacent_class(df):
     class_ids = []
@@ -103,7 +105,15 @@ def get_4bar_adjacent_class(df):
     return df
 
 # -----------------------------
-# Convert bit pattern to human-readable format
+# Forward returns
+# -----------------------------
+def add_forward_returns(df, horizons=[6,12,18,24]):
+    for h in horizons:
+        df[f'return_{h}b'] = (df['close'].shift(-h) - df['close']) / df['close'] * 100
+    return df
+
+# -----------------------------
+# Bits to human-readable
 # -----------------------------
 def bits_to_readable(bits):
     if bits is None:
@@ -115,68 +125,56 @@ def bits_to_readable(bits):
     return readable
 
 # -----------------------------
-# Compute forward returns
-# -----------------------------
-def add_forward_returns(df, horizons=[6,12,18,24]):
-    for h in horizons:
-        df[f'return_{h}b'] = (df['close'].shift(-h) - df['close']) / df['close'] * 100
-    return df
-
-# -----------------------------
-# Process a symbol: fetch, classify, returns
+# Process one symbol and return DataFrame
 # -----------------------------
 async def process_symbol(symbol, interval='1h', years=4, horizons=[6,12,18,24]):
     df = await get_historical_ohlc(symbol, interval, years)
     df_classed = get_4bar_adjacent_class(df)
     df_classed = add_forward_returns(df_classed, horizons)
-    
     valid = df_classed.dropna(subset=['4bar_class'] + [f'return_{h}b' for h in horizons]).copy()
     valid['4bar_class'] = valid['4bar_class'].astype(int)
     return valid
 
 # -----------------------------
-# Aggregate across symbols and analyze returns
+# Main incremental analysis
 # -----------------------------
 async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occurrences=300):
-    aggregated = pd.DataFrame()
+    output_file = "4bar_class_complete.csv"
+    # Remove old CSV
+    if os.path.exists(output_file):
+        os.remove(output_file)
 
     for symbol in symbols:
         df_symbol = await process_symbol(symbol, interval, years, horizons)
-        aggregated = pd.concat([aggregated, df_symbol], ignore_index=True)
+        # Count occurrences
+        occurrences = df_symbol['4bar_class'].value_counts()
+        valid_classes = occurrences[occurrences >= min_occurrences].index
+        df_symbol = df_symbol[df_symbol['4bar_class'].isin(valid_classes)]
 
-    # Count occurrences per pattern
-    occurrences = aggregated['4bar_class'].value_counts()
-    valid_classes = occurrences[occurrences >= min_occurrences].index
-    aggregated = aggregated[aggregated['4bar_class'].isin(valid_classes)]
+        grouped = df_symbol.groupby('4bar_class')
+        result_rows = []
+        for cls in tqdm(grouped.groups.keys(), desc=f"Analyzing {symbol}", ncols=80):
+            group = grouped.get_group(cls)
+            row = {'4bar_class': cls, 'occurrences': len(group)}
+            for h in horizons:
+                returns = group[f'return_{h}b']
+                row[f'return_{h}b'] = returns.mean()
+                pos_sum = returns[returns>0].sum()
+                neg_sum = returns[returns<0].sum()
+                row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum)>0 else float('inf')
+            row['pattern'] = bits_to_readable(group['pattern_bits'].iloc[0])
+            result_rows.append(row)
 
-    # Compute average returns, profit factor, and store occurrences with progress bar
-    result_rows = []
-    grouped = aggregated.groupby('4bar_class')
-    for cls in tqdm(grouped.groups.keys(), desc="Analyzing patterns", ncols=80):
-        group = grouped.get_group(cls)
-        row = {'4bar_class': cls, 'occurrences': len(group)}
-        for h in horizons:
-            returns = group[f'return_{h}b']
-            row[f'return_{h}b'] = returns.mean()
-            pos_sum = returns[returns>0].sum()
-            neg_sum = returns[returns<0].sum()
-            row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum)>0 else float('inf')
-        row['pattern'] = bits_to_readable(group['pattern_bits'].iloc[0])
-        result_rows.append(row)
+        result_df = pd.DataFrame(result_rows)
+        # Append to CSV incrementally
+        header = not os.path.exists(output_file)
+        result_df.to_csv(output_file, mode='a', index=False, header=header)
 
-    result_df = pd.DataFrame(result_rows)
-    result_df = result_df.sort_values(by='return_6b', ascending=False)
-
-    # Save CSV
-    result_df.to_csv("complete.csv", index=False)
-    print("\nCSV saved as 4bar_class_complete.csv")
-    print(result_df.head(10))
-
-    # Pause at the end to keep tmux open
+    print(f"\nCSV saved as {output_file}")
     input("\nScan completed. Press Enter to exit...")
 
 # -----------------------------
-# Run script
+# Run
 # -----------------------------
 if __name__ == "__main__":
     symbols = ['BTCUSDT','ETHUSDT','BNBUSDT']
