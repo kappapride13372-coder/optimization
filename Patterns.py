@@ -6,23 +6,12 @@ Usage:
   - Install requirements: pip install ccxt pandas numpy scipy tqdm matplotlib
   - Run: python keltner_channel_optimizer.py
 
-What it does:
-  1. Downloads OHLCV from Binance (public REST via ccxt)
-  2. Computes EMA (middle), ATR, and Keltner bands
-  3. Generates breakout signals (long on close above upper band, exit on close below mean band or stoploss)
-  4. Vectorized backtest (fixed position sizing: fraction of equity)
-  5. Grid search over EMA_length, ATR_length, multiplier
-  6. Tests multiple symbols and aggregates results across them
-  7. Outputs CSVs with metrics aggregated by parameter set (summed/averaged)
-  8. Plots a single PNG containing all equity curves across parameter combos (symbols aggregated)
-
 Notes:
-  - This is a simple, educational framework. Extend with commissions, slippage,
-    position sizing, risk management, walk-forward validation, cross-validation.
-  - Use out-of-sample / walk-forward testing before deploying live.
-
+  - This version is headless-server compatible; Matplotlib uses Agg backend for PNG output.
 """
 
+import matplotlib
+matplotlib.use('Agg')  # Headless backend for servers/droplets
 import ccxt
 import pandas as pd
 import numpy as np
@@ -31,6 +20,34 @@ from itertools import product
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
+
+# --------------------------- USER CONFIG ---------------------------
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', "HMSTRUSDT","BBUSDT","ACTUSDT","HOOKUSDT","SXTUSDT","FLOWUSDT","MUBARAKUSDT","DEXEUSDT",
+    "1000CATUSDT","THETAUSDT","COOKIEUSDT","AVAXUSDT","LQTYUSDT","EPICUSDT","ACXUSDT","CTSIUSDT",
+    "GMTUSDT","QNTUSDT","ARKUSDT","ONGUSDT","WIFUSDT","CYBERUSDT","PORTALUSDT","FIDAUSDT",
+    "PIXELUSDT","NEXOUSDT","FORMUSDT","CUSDT","BANANAUSDT","KNCUSDT","LRCUSDT","JASMYUSDT",
+    "XAIUSDT","EGLDUSDT","TOWNSUSDT","ILVUSDT","DODOUSDT","QIUSDT","HOLOUSDT","EDUUSDT",
+    "VELODROMEUSDT","INITUSDT","MANTAUSDT","BICOUSDT","OPENUSDT","BEAMXUSDT","C98USDT","RDNTUSDT",
+    "OXTUSDT","ACEUSDT","PHAUSDT","SKLUSDT","AIXBTUSDT","HYPERUSDT","KAIAUSDT","DOTUSDT","FTTUSDT",
+    "ZECUSDT","BONKUSDT","NEARUSDT","PYTHUSDT","PHBUSDT","TNSRUSDT","SFPUSDT","AXLUSDT","AEVOUSDT",
+    ]
+TIMEFRAME = '4h'
+START_DATE = '2022-01-01'
+END_DATE = None
+EXCHANGE = 'binance'
+EMA_LENGTHS = [30, 60, 90, 120]
+ATR_LENGTHS = [30, 60, 90, 120]
+MULTIPLIERS = [x * 0.5 for x in range(2, 7)]
+INITIAL_CAPITAL = 10000.0
+RISK_PER_TRADE = 0.01
+COMMISSION = 0.001
+SLIPPAGE_PCT = 0.0005
+STOPLOSS_PCT = 0.05
+MIN_BARS = 200
+OUTPUT_DIR = 'keltner_optimizer_out'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- rest of the script remains the same, plotting uses plt.savefig() ---
 
 # --------------------------- USER CONFIG ---------------------------
 SYMBOLS = ['BTC/USDT', 'ETH/USDT']  # Binance pairs to test simultaneously
