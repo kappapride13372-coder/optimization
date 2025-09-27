@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_incremental.py
+four_bar_patterns_complete_fee.py
 Fetch OHLC from Binance, classify 4-bar windows,
-compute average forward returns (6,12,18,24 bars), profit factor,
+compute fee-adjusted forward returns (6,12,18,24 bars), profit factor,
+average positive/negative returns, % positive/negative returns,
 count occurrences, filter patterns >=300 times, and write results incrementally to CSV.
 Safe for low-RAM droplets.
 """
@@ -70,8 +71,7 @@ async def get_historical_ohlc(symbol, interval='1h', years=4):
     ])
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-    # Keep only essential columns
-    df = df[['open','high','low','close']]
+    df = df[['open','high','low','close']]  # Keep only essential columns
     df = df.astype(float)
     return df
 
@@ -138,15 +138,13 @@ async def process_symbol(symbol, interval='1h', years=4, horizons=[6,12,18,24]):
 # -----------------------------
 # Main incremental analysis
 # -----------------------------
-async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occurrences=300):
+async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occurrences=300, fee=0.2):
     output_file = "4bar_class_complete.csv"
-    # Remove old CSV
     if os.path.exists(output_file):
         os.remove(output_file)
 
     for symbol in symbols:
         df_symbol = await process_symbol(symbol, interval, years, horizons)
-        # Count occurrences
         occurrences = df_symbol['4bar_class'].value_counts()
         valid_classes = occurrences[occurrences >= min_occurrences].index
         df_symbol = df_symbol[df_symbol['4bar_class'].isin(valid_classes)]
@@ -157,16 +155,31 @@ async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occur
             group = grouped.get_group(cls)
             row = {'4bar_class': cls, 'occurrences': len(group)}
             for h in horizons:
-                returns = group[f'return_{h}b']
+                # Fee-adjusted returns
+                returns = group[f'return_{h}b'] - fee
                 row[f'return_{h}b'] = returns.mean()
-                pos_sum = returns[returns>0].sum()
-                neg_sum = returns[returns<0].sum()
-                row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum)>0 else float('inf')
+
+                pos_returns = returns[returns > 0]
+                neg_returns = returns[returns < 0]
+
+                # Profit factor
+                pos_sum = pos_returns.sum()
+                neg_sum = neg_returns.sum()
+                row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum) > 0 else float('inf')
+
+                # Average positive and negative returns
+                row[f'avg_pos_{h}b'] = pos_returns.mean() if len(pos_returns) > 0 else 0
+                row[f'avg_neg_{h}b'] = neg_returns.mean() if len(neg_returns) > 0 else 0
+
+                # Share of positive and negative returns
+                total = len(returns)
+                row[f'%pos_{h}b'] = len(pos_returns) / total * 100
+                row[f'%neg_{h}b'] = len(neg_returns) / total * 100
+
             row['pattern'] = bits_to_readable(group['pattern_bits'].iloc[0])
             result_rows.append(row)
 
         result_df = pd.DataFrame(result_rows)
-        # Append to CSV incrementally
         header = not os.path.exists(output_file)
         result_df.to_csv(output_file, mode='a', index=False, header=header)
 
@@ -177,5 +190,12 @@ async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occur
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    symbols = ['BTCUSDT','ETHUSDT','BNBUSDT']
+    symbols = ["KAITOUSDT","REDUSDT","ROSEUSDT","HOMEUSDT","XVGUSDT","BANDUSDT","DENTUSDT","APEUSDT","BMTUSDT",
+    "ANKRUSDT","ATOMUSDT","SOMIUSDT","CAKEUSDT","VICUSDT","ENSUSDT","KDAUSDT","AUSDT","KSMUSDT",
+    "SAGAUSDT","TIAUSDT","AXSUSDT","NEWTUSDT","FILUSDT","ENAUSDT","COSUSDT","HEIUSDT","GLMUSDT",
+    "SKYUSDT","DOGEUSDT","BNSOLUSDT","GALAUSDT","HBARUSDT","TRUMPUSDT","VIRTUALUSDT","TUSDT","SSVUSDT",
+    "HFTUSDT","PENDLEUSDT","FXSUSDT","ALICEUSDT","1MBABYDOGEUSDT","API3USDT","NOTUSDT","SXPUSDT",
+    "PENGUUSDT","GRTUSDT","SUSDT","SUSHIUSDT","IOTAUSDT","BOMEUSDT","TUTUSDT","BLURUSDT","FLOKIUSDT",
+    "OMUSDT","SUIUSDT","1000SATSUSDT","TURBOUSDT","LAYERUSDT","AVAUSDT","XECUSDT","SCUSDT","RAYUSDT",
+    "STOUSDT","COWUSDT","NEIROUSDT","MANAUSDT"]
     asyncio.run(main(symbols))
