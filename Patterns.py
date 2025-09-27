@@ -1,7 +1,6 @@
 """
 Memory-efficient Keltner Channel optimizer with aggregated CSV and multiple equity graphs
 
-- Shows progress while downloading OHLCV bars per symbol
 - Processes one symbol at a time
 - Aggregates metrics across symbols (numeric only, avoids column duplication)
 - Generates CSV including profit factor
@@ -18,7 +17,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 from itertools import product
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import os
 import gc
 
@@ -47,23 +46,19 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------------------- HELPERS ---------------------------
 
-def fetch_ohlcv(symbol, timeframe, start_date='2022-01-01'):
+def fetch_ohlcv(symbol, timeframe, start_date='2018-01-01'):
     exchange = ccxt.binance({'enableRateLimit': True})
     since_ms = int(pd.to_datetime(start_date).timestamp() * 1000)
     all_bars = []
     limit = 1000
-    print(f'Fetching data for {symbol}...')
-    pbar = tqdm(desc=f'{symbol} OHLCV', unit='bars')
     while True:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
         if not bars:
             break
         all_bars += bars
         since_ms = bars[-1][0] + 1
-        pbar.update(len(bars))
         if len(bars) < limit:
             break
-    pbar.close()
     df = pd.DataFrame(all_bars, columns=['timestamp','open','high','low','close','volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('datetime', inplace=True)
@@ -163,7 +158,7 @@ def backtest(df, signals, return_equity_curve=False):
 def run_grid():
     all_results = []
 
-    # Fetch all symbols once with progress bars
+    # Fetch all symbols once
     data_dict = {symbol: fetch_ohlcv(symbol, TIMEFRAME) for symbol in SYMBOLS}
 
     # Grid search per symbol
@@ -197,4 +192,43 @@ def run_grid():
     top_sortino = df_agg.sort_values('sortino', ascending=False).head(TOP_N_PLOT)
     plt.figure(figsize=(12,8))
     for _, row in top_sortino.iterrows():
-        df_kc = compute_keltner(df_first, row.
+        df_kc = compute_keltner(df_first, row.ema_len, row.atr_len, row.multiplier)
+        signals = generate_signals(df_kc)
+        eq_curve, _ = backtest(df_kc, signals, return_equity_curve=True)
+        plt.plot(eq_curve.index, eq_curve.values/eq_curve.iloc[0], label=f"EMA{row.ema_len}_ATR{row.atr_len}_M{row.multiplier}")
+        del df_kc, signals, eq_curve
+        gc.collect()
+    plt.title(f'Top {TOP_N_PLOT} Equity Curves by Sortino Ratio')
+    plt.xlabel('Date')
+    plt.ylabel('Normalized Equity')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'top5_sortino_equity.png'), dpi=150)
+    plt.close()
+
+    # Top 5 by total return
+    top_return = df_agg.sort_values('total_return', ascending=False).head(TOP_N_PLOT)
+    plt.figure(figsize=(12,8))
+    for _, row in top_return.iterrows():
+        df_kc = compute_keltner(df_first, row.ema_len, row.atr_len, row.multiplier)
+        signals = generate_signals(df_kc)
+        eq_curve, _ = backtest(df_kc, signals, return_equity_curve=True)
+        plt.plot(eq_curve.index, eq_curve.values/eq_curve.iloc[0], label=f"EMA{row.ema_len}_ATR{row.atr_len}_M{row.multiplier}")
+        del df_kc, signals, eq_curve
+        gc.collect()
+    plt.title(f'Top {TOP_N_PLOT} Equity Curves by Total Return')
+    plt.xlabel('Date')
+    plt.ylabel('Normalized Equity')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR,'top5_total_return_equity.png'), dpi=150)
+    plt.close()
+
+    print("Finished plotting all top equity graphs.")
+
+
+if __name__ == '__main__':
+    run_grid()
+    input("Press Enter to exit...")
