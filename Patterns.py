@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_returns_pf.py
-Fetch OHLC from Binance sequentially with progress bars, classify 4-bar windows,
-compute average forward returns (6,12,18,24 bars) and profit factor, 
-and save a single CSV for all symbols including human-readable patterns.
+four_bar_patterns_complete_occurrences.py
+Fetch OHLC from Binance with progress bars, classify 4-bar windows,
+compute average forward returns (6,12,18,24 bars), profit factor,
+count occurrences, filter patterns with at least 300 occurrences, 
+and save a CSV with all info.
 """
 
 import pandas as pd
@@ -129,47 +130,50 @@ async def process_symbol(symbol, interval='1h', years=4, horizons=[6,12,18,24]):
     df_classed = get_4bar_adjacent_class(df)
     df_classed = add_forward_returns(df_classed, horizons)
     
-    # Drop rows with missing 4bar_class or returns
-    valid = df_classed.dropna(subset=['4bar_class'] + [f'return_{h}b' for h in horizons])
+    valid = df_classed.dropna(subset=['4bar_class'] + [f'return_{h}b' for h in horizons]).copy()
     valid['4bar_class'] = valid['4bar_class'].astype(int)
     return valid
 
 # -----------------------------
-# Aggregate across symbols
+# Aggregate across symbols and analyze returns
 # -----------------------------
-async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24]):
+async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occurrences=300):
     aggregated = pd.DataFrame()
 
     for symbol in symbols:
         df_symbol = await process_symbol(symbol, interval, years, horizons)
         aggregated = pd.concat([aggregated, df_symbol], ignore_index=True)
 
-    # Group by 4bar_class
-    agg_funcs = {}
-    for h in horizons:
-        agg_funcs[f'return_{h}b'] = 'mean'
-        agg_funcs[f'pf_{h}b'] = lambda x: x[x>0].sum() / abs(x[x<0].sum()) if abs(x[x<0].sum())>0 else float('inf')
+    # Count occurrences per pattern
+    occurrences = aggregated['4bar_class'].value_counts()
+    valid_classes = occurrences[occurrences >= min_occurrences].index
+    aggregated = aggregated[aggregated['4bar_class'].isin(valid_classes)]
 
-    # Compute profit factor for each horizon
-    pf_df = pd.DataFrame()
-    for h in horizons:
-        pf = aggregated.groupby('4bar_class')[f'return_{h}b'].apply(lambda x: x[x>0].sum() / abs(x[x<0].sum()) if abs(x[x<0].sum())>0 else float('inf'))
-        pf_df[f'pf_{h}b'] = pf
+    # Compute average returns, profit factor, and store occurrences with progress bar
+    result_rows = []
+    grouped = aggregated.groupby('4bar_class')
+    for cls in tqdm(grouped.groups.keys(), desc="Analyzing patterns", ncols=80):
+        group = grouped.get_group(cls)
+        row = {'4bar_class': cls, 'occurrences': len(group)}
+        for h in horizons:
+            returns = group[f'return_{h}b']
+            row[f'return_{h}b'] = returns.mean()
+            pos_sum = returns[returns>0].sum()
+            neg_sum = returns[returns<0].sum()
+            row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum)>0 else float('inf')
+        row['pattern'] = bits_to_readable(group['pattern_bits'].iloc[0])
+        result_rows.append(row)
 
-    # Compute average returns
-    returns_df = aggregated.groupby('4bar_class')[[f'return_{h}b' for h in horizons]].mean()
-
-    # Merge returns and profit factor
-    result = returns_df.merge(pf_df, left_index=True, right_index=True).reset_index()
-
-    # Add human-readable pattern (first occurrence)
-    pattern_map = aggregated.groupby('4bar_class')['pattern_bits'].first().apply(bits_to_readable)
-    result['pattern'] = result['4bar_class'].map(pattern_map)
+    result_df = pd.DataFrame(result_rows)
+    result_df = result_df.sort_values(by='return_6b', ascending=False)
 
     # Save CSV
-    result.to_csv("4bar_class_returns_pf.csv", index=False)
-    print("\nCSV saved as 4bar_class_returns_pf.csv")
-    print(result.head(10))
+    result_df.to_csv("complete.csv", index=False)
+    print("\nCSV saved as 4bar_class_complete.csv")
+    print(result_df.head(10))
+
+    # Pause at the end to keep tmux open
+    input("\nScan completed. Press Enter to exit...")
 
 # -----------------------------
 # Run script
