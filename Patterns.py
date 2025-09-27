@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_async.py
-Fetch OHLC data from Binance asynchronously for multiple symbols, categorize 4-bar rolling windows 
-using adjacent comparisons, and print the top 10 most frequent patterns in a human-readable format.
+four_bar_patterns_droplet.py
+Fetch OHLC data from Binance safely on low-RAM droplets, categorize 4-bar rolling windows
+using adjacent comparisons, save CSV, and print top 10 patterns.
 """
 
 import pandas as pd
@@ -17,20 +17,27 @@ import time
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 # -----------------------------
-# Fetch OHLC chunk
+# Fetch a chunk of klines safely
 # -----------------------------
-async def fetch_klines(session, symbol, interval, start_str, limit=1000):
+async def fetch_klines(session, symbol, interval, start_str, limit=1000, retries=3):
     params = {
         "symbol": symbol,
         "interval": interval,
         "startTime": int(start_str.timestamp() * 1000),
         "limit": limit
     }
-    async with session.get(BASE_URL, params=params) as resp:
-        return await resp.json()
+    for attempt in range(retries):
+        try:
+            async with session.get(BASE_URL, params=params, timeout=10) as resp:
+                return await resp.json()
+        except Exception as e:
+            print(f"Error fetching {symbol} at {start_str} (attempt {attempt+1}): {e}")
+            await asyncio.sleep(2)
+    print(f"Failed to fetch {symbol} at {start_str} after {retries} attempts.")
+    return []
 
 # -----------------------------
-# Fetch full historical OHLC
+# Fetch full historical OHLC safely
 # -----------------------------
 async def get_historical_ohlc(symbol, interval='1h', years=4):
     end_time = datetime.utcnow()
@@ -45,7 +52,7 @@ async def get_historical_ohlc(symbol, interval='1h', years=4):
             all_data.extend(chunk)
             last_time = chunk[-1][0]
             start_time = datetime.utcfromtimestamp(last_time / 1000) + timedelta(hours=1)
-            await asyncio.sleep(0.1)  # slight delay to avoid rate limits
+            await asyncio.sleep(0.1)  # avoid hitting rate limits
 
     df = pd.DataFrame(all_data, columns=[
         'open_time','open','high','low','close','volume',
@@ -118,26 +125,27 @@ def print_top_patterns_readable(df, top_n=10):
         print(f"Class ID: {class_id}, Occurrences: {count}, Definition: {readable}")
 
 # -----------------------------
-# Async main function
+# Run symbol sequentially to save RAM
 # -----------------------------
-async def main(symbols, interval='1h', years=4):
-    tasks = []
-    for symbol in symbols:
-        print(f"Fetching {symbol}...")
-        tasks.append(get_historical_ohlc(symbol, interval, years))
+async def process_symbol(symbol, interval='1h', years=4):
+    print(f"\nFetching {symbol}...")
+    df = await get_historical_ohlc(symbol, interval, years)
+    print(f"{symbol} data fetched: {df.shape[0]} rows")
     
-    results = await asyncio.gather(*tasks)
-    ohlc_data = dict(zip(symbols, results))
-    return ohlc_data
+    df_classed = get_4bar_adjacent_class(df)
+    
+    # Save to CSV immediately
+    csv_filename = f"{symbol}_ohlc.csv"
+    df_classed.to_csv(csv_filename, index=False)
+    print(f"{symbol} data saved to {csv_filename}")
+    
+    # Print top patterns
+    print_top_patterns_readable(df_classed, top_n=10)
 
 # -----------------------------
-# Run the script
+# Main entry
 # -----------------------------
 if __name__ == "__main__":
     symbols = ['BTCUSDT','ETHUSDT','BNBUSDT']
-    ohlc_data = asyncio.run(main(symbols))
-
-    for symbol, df in ohlc_data.items():
-        print(f"\n{symbol} data fetched: {df.shape[0]} rows")
-        df_classed = get_4bar_adjacent_class(df)
-        print_top_patterns_readable(df_classed, top_n=10)
+    for symbol in symbols:
+        asyncio.run(process_symbol(symbol, interval='1h', years=4))
