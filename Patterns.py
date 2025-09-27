@@ -1,15 +1,14 @@
 """
-Memory-efficient Keltner Channel strategy optimizer with safe data fetching for Binance droplets
+Memory-efficient Keltner Channel optimizer with full historical data for droplets
 
 Features:
-- Fetches OHLCV in chunks with local CSV caching
-- 4h timeframe (can be changed)
+- 4h timeframe with full history
 - Grid search over EMA lengths, ATR lengths, multipliers
 - Entry: close above upper band
 - Exit: close below mean band OR 5% stoploss
-- Multi-symbol support
+- Processes one symbol at a time to save memory
 - Metrics: CAGR, Sharpe, Sortino, Calmar, max DD, win rate, profit factor
-- Only top 10 combos by profit factor are plotted
+- Only top 10 combos per symbol by profit factor are plotted
 - Headless Matplotlib for droplets
 """
 
@@ -22,77 +21,52 @@ import numpy as np
 from itertools import product
 from tqdm import tqdm
 import os
-import time
 
 # --------------------------- CONFIG ---------------------------
 SYMBOLS = ['BTC/USDT', 'ETH/USDT']
 TIMEFRAME = '4h'
-LOOKBACK_DAYS = 365  # fetch only last 1 year to save memory
 EMA_LENGTHS = [30, 60, 90, 120]
 ATR_LENGTHS = [30, 60, 90, 120]
 MULTIPLIERS = [x * 0.5 for x in range(2, 7)]
 INITIAL_CAPITAL = 10000.0
-COMMISSION = 0.001
+COMMISSION = 0.00075
 SLIPPAGE_PCT = 0.0005
 STOPLOSS_PCT = 0.05
 MIN_BARS = 200
+TOP_N_PLOT = 10
 OUTPUT_DIR = 'keltner_optimizer_out'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------------------- HELPERS ---------------------------
 
-def fetch_ohlcv(symbol, timeframe, lookback_days=LOOKBACK_DAYS):
+def fetch_ohlcv(symbol, timeframe, start_date='2022-01-01'):
     exchange = ccxt.binance({'enableRateLimit': True})
-    since_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    symbol_file = f'{OUTPUT_DIR}/{symbol.replace("/","_")}_ohlcv.csv'
-
-    if os.path.exists(symbol_file):
-        df = pd.read_csv(symbol_file, index_col='datetime', parse_dates=True)
-        print(f'Loaded cached data for {symbol} from {symbol_file}')
-        return df
-
-    print(f'Fetching {symbol} OHLCV from Binance...')
-    since_ms = int(pd.to_datetime(since_iso).timestamp() * 1000)
+    since_ms = int(pd.to_datetime(start_date).timestamp() * 1000)
     all_bars = []
     limit = 1000
     while True:
-        try:
-            bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
-        except ccxt.NetworkError as e:
-            print(f'Network error: {e}, retrying in 5s...')
-            time.sleep(5)
-            continue
+        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
         if not bars:
             break
         all_bars += bars
         since_ms = bars[-1][0] + 1
         if len(bars) < limit:
             break
-        time.sleep(0.2)  # avoid rate limit
-
     df = pd.DataFrame(all_bars, columns=['timestamp','open','high','low','close','volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('datetime', inplace=True)
     df = df[['open','high','low','close','volume']]
     df = df[~df.index.duplicated(keep='first')]
-    df.to_csv(symbol_file)
-    print(f'Saved fetched data for {symbol} to {symbol_file}')
     return df
-
-# EMA, ATR, compute_keltner, generate_signals, backtest remain the same as previous memory-efficient version
-# run_grid and plot_top10 functions remain the same, using fetch_ohlcv with caching and LOOKBACK_DAYS limit
-
 
 
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
-
 def atr(df, length):
     high, low, close = df['high'], df['low'], df['close']
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean()
-
 
 def compute_keltner(df, ema_len, atr_len, mult):
     middle = ema(df['close'], ema_len)
@@ -105,7 +79,6 @@ def compute_keltner(df, ema_len, atr_len, mult):
     df_kc['kc_lower'] = lower
     return df_kc
 
-
 def generate_signals(df):
     close = df['close']
     upper = df['kc_upper']
@@ -116,7 +89,6 @@ def generate_signals(df):
     signals['entry'] = long_entry.astype(int)
     signals['exit'] = long_exit.astype(int)
     return signals
-
 
 def backtest(df, signals, return_equity_curve=False):
     prices = df['close']
@@ -166,7 +138,7 @@ def backtest(df, signals, return_equity_curve=False):
     gross_loss = abs(sum([r for r in trade_returns if r<0]))
     profit_factor = gross_profit/gross_loss if gross_loss>0 else np.nan
 
-    metrics = {'equity_curve': eq, 'total_return': total_return, 'cagr': cagr, 'max_drawdown': max_dd,
+    metrics = {'total_return': total_return, 'cagr': cagr, 'max_drawdown': max_dd,
                'sharpe': sharpe, 'sortino': sortino, 'calmar': calmar, 'trades': len(trade_returns),
                'win_rate': win_rate, 'profit_factor': profit_factor}
     if return_equity_curve:
@@ -176,12 +148,11 @@ def backtest(df, signals, return_equity_curve=False):
 
 
 def run_grid():
-    results = []
-    combos = list(product(EMA_LENGTHS, ATR_LENGTHS, MULTIPLIERS))
-
     for symbol in SYMBOLS:
         print(f'Fetching {symbol}...')
-        df = fetch_ohlcv(symbol, TIMEFRAME, START_DATE)
+        df = fetch_ohlcv(symbol, TIMEFRAME)
+        results = []
+        combos = list(product(EMA_LENGTHS, ATR_LENGTHS, MULTIPLIERS))
         for ema_len, atr_len, mult in tqdm(combos, desc=f'Grid {symbol}'):
             if len(df) < max(ema_len, atr_len)+MIN_BARS:
                 continue
@@ -191,34 +162,29 @@ def run_grid():
             row = {'symbol': symbol, 'ema_len': ema_len, 'atr_len': atr_len, 'multiplier': mult}
             row.update(metrics)
             results.append(row)
+            del df_kc, signals  # free memory
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(os.path.join(OUTPUT_DIR,f'results_{symbol.replace("/","_")}.csv'), index=False)
 
-    df_all = pd.DataFrame(results)
-    df_agg = df_all.groupby(['ema_len','atr_len','multiplier']).mean().reset_index()
-    return df_all, df_agg, df
-
-
-def plot_top10(df_all, df_agg, df_full):
-    top10 = df_agg.sort_values('profit_factor', ascending=False).head(10)
-    plt.figure(figsize=(12,8))
-    for _, row in top10.iterrows():
-        metrics = backtest(df_full, generate_signals(compute_keltner(df_full, row.ema_len, row.atr_len, row.multiplier)), return_equity_curve=True)
-        eq_curve, _ = metrics
-        plt.plot(eq_curve.index, eq_curve.values/eq_curve.iloc[0], label=f"EMA{row.ema_len}_ATR{row.atr_len}_M{row.multiplier}")
-    plt.title('Top 10 Equity Curves by Profit Factor')
-    plt.xlabel('Date')
-    plt.ylabel('Normalized Equity')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    out_png = os.path.join(OUTPUT_DIR, 'top10_equity_curves.png')
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print(f'Top 10 equity curves saved to {out_png}')
+        # plot top N by profit factor
+        topN = df_results.sort_values('profit_factor', ascending=False).head(TOP_N_PLOT)
+        plt.figure(figsize=(12,8))
+        for _, row in topN.iterrows():
+            df_kc = compute_keltner(df, row.ema_len, row.atr_len, row.multiplier)
+            signals = generate_signals(df_kc)
+            eq_curve, _ = backtest(df_kc, signals, return_equity_curve=True)
+            plt.plot(eq_curve.index, eq_curve.values/eq_curve.iloc[0], label=f"EMA{row.ema_len}_ATR{row.atr_len}_M{row.multiplier}")
+            del df_kc, signals, eq_curve
+        plt.title(f'Top {TOP_N_PLOT} Equity Curves for {symbol}')
+        plt.xlabel('Date')
+        plt.ylabel('Normalized Equity')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR,f'top{TOP_N_PLOT}_equity_{symbol.replace("/","_")}.png'), dpi=150)
+        plt.close()
 
 
 if __name__ == '__main__':
-    all_results, agg_results, df_full = run_grid()
-    all_results.to_csv(os.path.join(OUTPUT_DIR,'results_per_symbol.csv'), index=False)
-    agg_results.to_csv(os.path.join(OUTPUT_DIR,'results_aggregated.csv'), index=False)
-    plot_top10(all_results, agg_results, df_full)
-    print('\nDone.')
+    run_grid()
+    print('Done.')
