@@ -1,221 +1,210 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Keltner Channel strategy optimizer for Binance historical data
+
+Usage:
+  - Edit SYMBOLS, TIMEFRAME, START_DATE as needed (defaults: ['BTC/USDT'], '4h', '2022-01-01')
+  - Install requirements: pip install ccxt pandas numpy scipy tqdm matplotlib
+  - Run: python keltner_channel_optimizer.py
+
+What it does:
+  1. Downloads OHLCV from Binance (public REST via ccxt)
+  2. Computes EMA (middle), ATR, and Keltner bands
+  3. Generates breakout signals (long on close above upper band, exit on close below mean band or stoploss)
+  4. Vectorized backtest (fixed position sizing: fraction of equity)
+  5. Grid search over EMA_length, ATR_length, multiplier
+  6. Tests multiple symbols and aggregates results across them
+  7. Outputs CSVs with metrics aggregated by parameter set (summed/averaged)
+  8. Plots a single PNG containing all equity curves across parameter combos (symbols aggregated)
+
+Notes:
+  - This is a simple, educational framework. Extend with commissions, slippage,
+    position sizing, risk management, walk-forward validation, cross-validation.
+  - Use out-of-sample / walk-forward testing before deploying live.
 
 """
-four_bar_patterns_complete_normalized.py
-Fetch OHLC from Binance, classify 4-bar windows with normalized IDs,
-compute fee-adjusted forward returns (6,12,18,24 bars), profit factor,
-average positive/negative returns, % positive/negative returns,
-count occurrences, and write results incrementally to CSV.
-Safe for low-RAM droplets.
-"""
 
+import ccxt
 import pandas as pd
-import asyncio
-import aiohttp
-from datetime import datetime, timedelta, timezone
+import numpy as np
+from datetime import datetime, timedelta
+from itertools import product
 from tqdm import tqdm
-import math
 import os
-import hashlib
+import matplotlib.pyplot as plt
 
-BASE_URL = "https://api.binance.com/api/v3/klines"
+# --------------------------- USER CONFIG ---------------------------
+SYMBOLS = ['BTC/USDT', 'ETH/USDT']  # Binance pairs to test simultaneously
+TIMEFRAME = '4h'                    # ccxt timeframe
+START_DATE = '2022-01-01'           # UTC start (YYYY-MM-DD)
+END_DATE = None                     # None for now -> uses most recent available
+EXCHANGE = 'binance'
 
-# -----------------------------
-# Fetch OHLC chunk safely
-# -----------------------------
-async def fetch_klines(session, symbol, interval, start_str, limit=1000, retries=3):
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "startTime": int(start_str.timestamp() * 1000),
-        "limit": limit
+# Parameter grid to search
+EMA_LENGTHS = [30, 60, 90, 120]
+ATR_LENGTHS = [30, 60, 90, 120]
+MULTIPLIERS = [x * 0.5 for x in range(2, 7)]  # 1.0 to 3.0 in 0.5 steps
+
+# Backtest settings
+INITIAL_CAPITAL = 10000.0    # USD
+RISK_PER_TRADE = 0.01        # fraction of equity risked per trade (used for sizing if stoploss used)
+COMMISSION = 0.00075         # proportion per trade (example, adjust to Binance futures/spot fees)
+SLIPPAGE_PCT = 0.0005        # fraction of price lost to slippage on entries/exits
+STOPLOSS_PCT = 0.05          # initial stoploss of 5% from entry
+MIN_BARS = 200               # minimum bars required for indicator lengths
+
+# Output
+OUTPUT_DIR = 'keltner_optimizer_out'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --------------------------- HELPERS ---------------------------
+
+def fetch_ohlcv_ccxt(symbol, timeframe, since_iso):
+    exchange = getattr(ccxt, EXCHANGE)({'enableRateLimit': True})
+    since_ms = int(pd.to_datetime(since_iso).timestamp() * 1000)
+    all_bars = []
+    limit = 1000
+    while True:
+        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        if not bars:
+            break
+        all_bars += bars
+        since_ms = bars[-1][0] + 1
+        if len(bars) < limit:
+            break
+    df = pd.DataFrame(all_bars, columns=['timestamp','open','high','low','close','volume'])
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df = df.set_index('datetime')
+    df = df[~df.index.duplicated(keep='first')]
+    return df
+
+
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def atr(df, length):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=1).mean()
+
+
+def compute_keltner(df, ema_len, atr_len, mult):
+    middle = ema(df['close'], ema_len)
+    a = atr(df, atr_len)
+    upper = middle + mult * a
+    lower = middle - mult * a
+    out = df.copy()
+    out['kc_middle'] = middle
+    out['kc_upper'] = upper
+    out['kc_lower'] = lower
+    return out
+
+
+def generate_signals(df):
+    close = df['close']
+    upper = df['kc_upper']
+    middle = df['kc_middle']
+
+    long_entry = (close.shift(1) <= upper.shift(1)) & (close > upper)  # entry: close above upper band
+    long_exit = (close.shift(1) >= middle.shift(1)) & (close < middle)  # exit: close below mean band
+
+    signals = pd.DataFrame(index=df.index)
+    signals['entry'] = long_entry.astype(int)
+    signals['exit'] = long_exit.astype(int)
+    return signals
+
+
+def backtest_vectorized(df, signals, initial_capital=INITIAL_CAPITAL):
+    prices = df['close']
+    entries = signals['entry']
+    exits = signals['exit']
+
+    position = 0
+    equity = initial_capital
+    cash = initial_capital
+    shares = 0.0
+
+    equity_curve = []
+    trade_returns = []
+    entry_price = None
+    stoploss_price = None
+
+    for i in range(len(df)):
+        price = prices.iat[i]
+
+        # check stoploss
+        if position == 1 and price <= stoploss_price:
+            cash += shares * price  # exit at stoploss
+            commission = equity * COMMISSION
+            cash -= commission
+            trade_return = (price - entry_price) / entry_price if entry_price else 0
+            trade_returns.append(trade_return)
+            shares = 0
+            position = 0
+            stoploss_price = None
+            entry_price = None
+
+        # normal entry
+        if entries.iat[i] and position == 0:
+            entry_price = price * (1 + SLIPPAGE_PCT)
+            shares = cash / entry_price
+            commission = equity * COMMISSION
+            cash -= shares * entry_price + commission
+            position = 1
+            stoploss_price = entry_price * (1 - STOPLOSS_PCT)
+
+        # normal exit (close below mean band)
+        elif exits.iat[i] and position == 1:
+            exit_price = price * (1 - SLIPPAGE_PCT)
+            cash += shares * exit_price
+            commission = equity * COMMISSION
+            cash -= commission
+            trade_return = (exit_price - entry_price) / entry_price if entry_price else 0
+            trade_returns.append(trade_return)
+            shares = 0
+            position = 0
+            stoploss_price = None
+            entry_price = None
+
+        current_value = cash + (shares * price if shares else 0)
+        equity = current_value
+        equity_curve.append(equity)
+
+    eq = pd.Series(equity_curve, index=df.index)
+    total_return = eq.iloc[-1] / eq.iloc[0] - 1
+    days = (eq.index[-1] - eq.index[0]).total_seconds() / (3600*24)
+    years = days / 365.25
+    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
+    rolling_max = eq.cummax()
+    drawdown = (eq - rolling_max) / rolling_max
+    max_dd = drawdown.min()
+
+    daily_rets = eq.resample('1D').last().pct_change().dropna()
+    mean_ret = daily_rets.mean()
+    std_ret = daily_rets.std()
+    downside_std = daily_rets[daily_rets < 0].std()
+
+    sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else np.nan
+    sortino = (mean_ret / downside_std) * np.sqrt(252) if downside_std > 0 else np.nan
+    calmar = cagr / abs(max_dd) if max_dd < 0 else np.nan
+    volatility = std_ret * np.sqrt(252)
+
+    trades = int(signals['entry'].sum())
+    win_rate = (np.array(trade_returns) > 0).mean() if trade_returns else np.nan
+
+    metrics = {
+        'equity_curve': eq,
+        'total_return': total_return,
+        'cagr': cagr,
+        'max_drawdown': max_dd,
+        'sharpe': sharpe,
+        'sortino': sortino,
+        'calmar': calmar,
+        'volatility': volatility,
+        'trades': trades,
+        'win_rate': win_rate
     }
-    for attempt in range(retries):
-        try:
-            async with session.get(BASE_URL, params=params, timeout=10) as resp:
-                return await resp.json()
-        except Exception as e:
-            print(f"Error fetching {symbol} at {start_str} (attempt {attempt+1}): {e}")
-            await asyncio.sleep(2)
-    print(f"Failed to fetch {symbol} at {start_str} after {retries} attempts.")
-    return []
 
-# -----------------------------
-# Get historical OHLC for one symbol
-# -----------------------------
-async def get_historical_ohlc(symbol, interval='1h', years=4):
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=365*years)
-    all_data = []
-
-    async with aiohttp.ClientSession() as session:
-        total_hours = years * 365 * 24
-        iterations = math.ceil(total_hours / 1000)
-        pbar = tqdm(total=iterations, desc=f"{symbol} fetching", ncols=80)
-        
-        while start_time < end_time:
-            chunk = await fetch_klines(session, symbol, interval, start_time)
-            if not chunk:
-                break
-            all_data.extend(chunk)
-            last_time = chunk[-1][0]
-            start_time = datetime.fromtimestamp(last_time / 1000, tz=timezone.utc) + timedelta(hours=1)
-            await asyncio.sleep(0.05)
-            pbar.update(1)
-        pbar.close()
-
-    df = pd.DataFrame(all_data, columns=[
-        'open_time','open','high','low','close','volume',
-        'close_time','quote_asset_volume','number_of_trades',
-        'taker_buy_base','taker_buy_quote','ignore'
-    ])
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-    df = df[['open','high','low','close']]  # Keep only essential columns
-    df = df.astype(float)
-    return df
-
-# -----------------------------
-# Normalize 4-bar pattern to hash ID
-# -----------------------------
-def pattern_to_id(pattern_bits):
-    # Group bits by bar (4 columns per bar)
-    bars = [pattern_bits[i:i+4] for i in range(0, len(pattern_bits), 4)]
-    # Convert to string
-    pattern_str = ''.join([''.join(str(b) for b in bar) for bar in bars])
-    # Use hash to generate integer ID
-    return int(hashlib.md5(pattern_str.encode()).hexdigest()[:8], 16)
-
-# -----------------------------
-# Classify 4-bar adjacent patterns with normalized ID
-# -----------------------------
-def get_4bar_adjacent_class(df):
-    class_ids = []
-    pattern_defs = []
-
-    for i in range(3, len(df)):
-        window = df.iloc[i-3:i+1]
-        bits = []
-        for col in ['open','high','low','close']:
-            bits.append(int(window[col].iloc[1] > window[col].iloc[0]))
-            bits.append(int(window[col].iloc[2] > window[col].iloc[1]))
-            bits.append(int(window[col].iloc[3] > window[col].iloc[2]))
-
-        class_id = pattern_to_id(bits)
-        class_ids.append(class_id)
-        pattern_defs.append(bits)
-
-    class_ids = [None, None, None] + class_ids
-    pattern_defs = [None, None, None] + pattern_defs
-
-    df['4bar_class'] = class_ids
-    df['pattern_bits'] = pattern_defs
-    return df
-
-# -----------------------------
-# Forward returns
-# -----------------------------
-def add_forward_returns(df, horizons=[6,12,18,24]):
-    for h in horizons:
-        df[f'return_{h}b'] = (df['close'].shift(-h) - df['close']) / df['close'] * 100
-    return df
-
-# -----------------------------
-# Bits to human-readable
-# -----------------------------
-def bits_to_readable(bits):
-    if bits is None:
-        return None
-    attrs = ['open','high','low','close']
-    readable = {}
-    for i, attr in enumerate(attrs):
-        readable[attr] = ['above' if b==1 else 'below_or_equal' for b in bits[i*3:(i+1)*3]]
-    return readable
-
-# -----------------------------
-# Process one symbol and return DataFrame
-# -----------------------------
-async def process_symbol(symbol, interval='1h', years=4, horizons=[6,12,18,24]):
-    df = await get_historical_ohlc(symbol, interval, years)
-    df_classed = get_4bar_adjacent_class(df)
-    df_classed = add_forward_returns(df_classed, horizons)
-    valid = df_classed.dropna(subset=['4bar_class'] + [f'return_{h}b' for h in horizons]).copy()
-    valid['4bar_class'] = valid['4bar_class'].astype(int)
-    return valid
-
-# -----------------------------
-# Main incremental analysis
-# -----------------------------
-async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occurrences=300, fee=0.2):
-    output_file = "4bar_class_complete.csv"
-    if os.path.exists(output_file):
-        os.remove(output_file)
-
-    for symbol in symbols:
-        df_symbol = await process_symbol(symbol, interval, years, horizons)
-        occurrences = df_symbol['4bar_class'].value_counts()
-        valid_classes = occurrences[occurrences >= min_occurrences].index
-        df_symbol = df_symbol[df_symbol['4bar_class'].isin(valid_classes)]
-
-        grouped = df_symbol.groupby('4bar_class')
-        result_rows = []
-        for cls in tqdm(grouped.groups.keys(), desc=f"Analyzing {symbol}", ncols=80):
-            group = grouped.get_group(cls)
-            row = {'4bar_class': cls, 'occurrences': len(group)}
-            for h in horizons:
-                # Fee-adjusted returns
-                returns = group[f'return_{h}b'] - fee
-                row[f'return_{h}b'] = returns.mean()
-
-                pos_returns = returns[returns > 0]
-                neg_returns = returns[returns < 0]
-
-                # Profit factor
-                pos_sum = pos_returns.sum()
-                neg_sum = neg_returns.sum()
-                row[f'pf_{h}b'] = pos_sum / abs(neg_sum) if abs(neg_sum) > 0 else float('inf')
-
-                # Average positive and negative returns
-                row[f'avg_pos_{h}b'] = pos_returns.mean() if len(pos_returns) > 0 else 0
-                row[f'avg_neg_{h}b'] = neg_returns.mean() if len(neg_returns) > 0 else 0
-
-                # Share of positive and negative returns
-                total = len(returns)
-                row[f'%pos_{h}b'] = len(pos_returns) / total * 100
-                row[f'%neg_{h}b'] = len(neg_returns) / total * 100
-
-            row['pattern'] = bits_to_readable(group['pattern_bits'].iloc[0])
-            result_rows.append(row)
-
-        result_df = pd.DataFrame(result_rows)
-
-        # Add CSV legend at top if file does not exist
-        if not os.path.exists(output_file):
-            legend = pd.DataFrame([{
-                '4bar_class': 'Unique ID for pattern',
-                'occurrences': 'Number of times pattern occurred',
-                **{f'return_{h}b': f'Avg fee-adjusted return after {h} bars' for h in horizons},
-                **{f'pf_{h}b': f'Profit factor after {h} bars' for h in horizons},
-                **{f'avg_pos_{h}b': f'Avg positive return after {h} bars' for h in horizons},
-                **{f'avg_neg_{h}b': f'Avg negative return after {h} bars' for h in horizons},
-                **{f'%pos_{h}b': f'% positive returns after {h} bars' for h in horizons},
-                **{f'%neg_{h}b': f'% negative returns after {h} bars' for h in horizons},
-                'pattern': 'Human-readable pattern bits'
-            }])
-            legend.to_csv(output_file, index=False, mode='w')
-            result_df.to_csv(output_file, index=False, mode='a', header=False)
-        else:
-            result_df.to_csv(output_file, mode='a', index=False, header=False)
-
-    print(f"\nCSV saved as {output_file}")
-    input("\nScan completed. Press Enter to exit...")
-
-# -----------------------------
-# Run
-# -----------------------------
-if __name__ == "__main__":
-    symbols = ['BTCUSDT','ETHUSDT','BNBUSDT',"KAITOUSDT","REDUSDT","ROSEUSDT","HOMEUSDT","XVGUSDT","BANDUSDT","DENTUSDT","APEUSDT","BMTUSDT",
-    "ANKRUSDT","ATOMUSDT","SOMIUSDT","CAKEUSDT","VICUSDT","ENSUSDT","KDAUSDT","AUSDT","KSMUSDT",
-    "SAGAUSDT","TIAUSDT","AXSUSDT","NEWTUSDT","FILUSDT","ENAUSDT","COSUSDT","HEIUSDT","GLMUSDT",]
-    asyncio.run(main(symbols))
+    return eq, metrics
