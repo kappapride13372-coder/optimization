@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_complete_fee.py
-Fetch OHLC from Binance, classify 4-bar windows,
+four_bar_patterns_complete_normalized.py
+Fetch OHLC from Binance, classify 4-bar windows with normalized IDs,
 compute fee-adjusted forward returns (6,12,18,24 bars), profit factor,
 average positive/negative returns, % positive/negative returns,
-count occurrences, filter patterns >=300 times, and write results incrementally to CSV.
+count occurrences, and write results incrementally to CSV.
 Safe for low-RAM droplets.
 """
 
@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from tqdm import tqdm
 import math
 import os
+import hashlib
 
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
@@ -76,7 +77,18 @@ async def get_historical_ohlc(symbol, interval='1h', years=4):
     return df
 
 # -----------------------------
-# Classify 4-bar adjacent patterns
+# Normalize 4-bar pattern to hash ID
+# -----------------------------
+def pattern_to_id(pattern_bits):
+    # Group bits by bar (4 columns per bar)
+    bars = [pattern_bits[i:i+4] for i in range(0, len(pattern_bits), 4)]
+    # Convert to string
+    pattern_str = ''.join([''.join(str(b) for b in bar) for bar in bars])
+    # Use hash to generate integer ID
+    return int(hashlib.md5(pattern_str.encode()).hexdigest()[:8], 16)
+
+# -----------------------------
+# Classify 4-bar adjacent patterns with normalized ID
 # -----------------------------
 def get_4bar_adjacent_class(df):
     class_ids = []
@@ -89,11 +101,8 @@ def get_4bar_adjacent_class(df):
             bits.append(int(window[col].iloc[1] > window[col].iloc[0]))
             bits.append(int(window[col].iloc[2] > window[col].iloc[1]))
             bits.append(int(window[col].iloc[3] > window[col].iloc[2]))
-        
-        class_id = 0
-        for bit in bits:
-            class_id = (class_id << 1) | bit
-        
+
+        class_id = pattern_to_id(bits)
         class_ids.append(class_id)
         pattern_defs.append(bits)
 
@@ -180,8 +189,24 @@ async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occur
             result_rows.append(row)
 
         result_df = pd.DataFrame(result_rows)
-        header = not os.path.exists(output_file)
-        result_df.to_csv(output_file, mode='a', index=False, header=header)
+
+        # Add CSV legend at top if file does not exist
+        if not os.path.exists(output_file):
+            legend = pd.DataFrame([{
+                '4bar_class': 'Unique ID for pattern',
+                'occurrences': 'Number of times pattern occurred',
+                **{f'return_{h}b': f'Avg fee-adjusted return after {h} bars' for h in horizons},
+                **{f'pf_{h}b': f'Profit factor after {h} bars' for h in horizons},
+                **{f'avg_pos_{h}b': f'Avg positive return after {h} bars' for h in horizons},
+                **{f'avg_neg_{h}b': f'Avg negative return after {h} bars' for h in horizons},
+                **{f'%pos_{h}b': f'% positive returns after {h} bars' for h in horizons},
+                **{f'%neg_{h}b': f'% negative returns after {h} bars' for h in horizons},
+                'pattern': 'Human-readable pattern bits'
+            }])
+            legend.to_csv(output_file, index=False, mode='w')
+            result_df.to_csv(output_file, index=False, mode='a', header=False)
+        else:
+            result_df.to_csv(output_file, mode='a', index=False, header=False)
 
     print(f"\nCSV saved as {output_file}")
     input("\nScan completed. Press Enter to exit...")
@@ -190,12 +215,7 @@ async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24], min_occur
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    symbols = ["KAITOUSDT","REDUSDT","ROSEUSDT","HOMEUSDT","XVGUSDT","BANDUSDT","DENTUSDT","APEUSDT","BMTUSDT",
+    symbols = ['BTCUSDT','ETHUSDT','BNBUSDT',"KAITOUSDT","REDUSDT","ROSEUSDT","HOMEUSDT","XVGUSDT","BANDUSDT","DENTUSDT","APEUSDT","BMTUSDT",
     "ANKRUSDT","ATOMUSDT","SOMIUSDT","CAKEUSDT","VICUSDT","ENSUSDT","KDAUSDT","AUSDT","KSMUSDT",
-    "SAGAUSDT","TIAUSDT","AXSUSDT","NEWTUSDT","FILUSDT","ENAUSDT","COSUSDT","HEIUSDT","GLMUSDT",
-    "SKYUSDT","DOGEUSDT","BNSOLUSDT","GALAUSDT","HBARUSDT","TRUMPUSDT","VIRTUALUSDT","TUSDT","SSVUSDT",
-    "HFTUSDT","PENDLEUSDT","FXSUSDT","ALICEUSDT","1MBABYDOGEUSDT","API3USDT","NOTUSDT","SXPUSDT",
-    "PENGUUSDT","GRTUSDT","SUSDT","SUSHIUSDT","IOTAUSDT","BOMEUSDT","TUTUSDT","BLURUSDT","FLOKIUSDT",
-    "OMUSDT","SUIUSDT","1000SATSUSDT","TURBOUSDT","LAYERUSDT","AVAUSDT","XECUSDT","SCUSDT","RAYUSDT",
-    "STOUSDT","COWUSDT","NEIROUSDT","MANAUSDT"]
+    "SAGAUSDT","TIAUSDT","AXSUSDT","NEWTUSDT","FILUSDT","ENAUSDT","COSUSDT","HEIUSDT","GLMUSDT",]
     asyncio.run(main(symbols))
