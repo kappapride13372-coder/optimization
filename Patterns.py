@@ -2,17 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-four_bar_patterns_droplet.py
-Fetch OHLC data from Binance safely on low-RAM droplets, categorize 4-bar rolling windows
-using adjacent comparisons, save CSV, and print top 10 patterns.
+four_bar_patterns_returns_pf.py
+Fetch OHLC from Binance sequentially with progress bars, classify 4-bar windows,
+compute average forward returns (6,12,18,24 bars) and profit factor, 
+and save a single CSV for all symbols including human-readable patterns.
 """
 
 import pandas as pd
 import asyncio
 import aiohttp
-from datetime import datetime, timedelta
-from collections import Counter
-import time
+from datetime import datetime, timedelta, timezone
+from tqdm import tqdm
+import math
 
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
@@ -37,22 +38,28 @@ async def fetch_klines(session, symbol, interval, start_str, limit=1000, retries
     return []
 
 # -----------------------------
-# Fetch full historical OHLC safely
+# Fetch full historical OHLC with progress bar
 # -----------------------------
 async def get_historical_ohlc(symbol, interval='1h', years=4):
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=365*years)
     all_data = []
 
     async with aiohttp.ClientSession() as session:
+        total_hours = years * 365 * 24
+        iterations = math.ceil(total_hours / 1000)
+        pbar = tqdm(total=iterations, desc=f"{symbol} fetching", ncols=80)
+        
         while start_time < end_time:
             chunk = await fetch_klines(session, symbol, interval, start_time)
             if not chunk:
                 break
             all_data.extend(chunk)
             last_time = chunk[-1][0]
-            start_time = datetime.utcfromtimestamp(last_time / 1000) + timedelta(hours=1)
-            await asyncio.sleep(0.1)  # avoid hitting rate limits
+            start_time = datetime.fromtimestamp(last_time / 1000, tz=timezone.utc) + timedelta(hours=1)
+            await asyncio.sleep(0.05)
+            pbar.update(1)
+        pbar.close()
 
     df = pd.DataFrame(all_data, columns=[
         'open_time','open','high','low','close','volume',
@@ -75,7 +82,6 @@ def get_4bar_adjacent_class(df):
     for i in range(3, len(df)):
         window = df.iloc[i-3:i+1]
         bits = []
-
         for col in ['open','high','low','close']:
             bits.append(int(window[col].iloc[1] > window[col].iloc[0]))
             bits.append(int(window[col].iloc[2] > window[col].iloc[1]))
@@ -92,13 +98,13 @@ def get_4bar_adjacent_class(df):
     pattern_defs = [None, None, None] + pattern_defs
 
     df['4bar_class'] = class_ids
-    df['4bar_pattern'] = pattern_defs
+    df['pattern_bits'] = pattern_defs
     return df
 
 # -----------------------------
-# Convert bit pattern to readable format
+# Convert bit pattern to human-readable format
 # -----------------------------
-def format_pattern_readable(bits):
+def bits_to_readable(bits):
     if bits is None:
         return None
     attrs = ['open','high','low','close']
@@ -108,44 +114,66 @@ def format_pattern_readable(bits):
     return readable
 
 # -----------------------------
-# Print top N patterns
+# Compute forward returns
 # -----------------------------
-def print_top_patterns_readable(df, top_n=10):
-    valid_patterns = df['4bar_class'].dropna().astype(int)
-    valid_defs = df['4bar_pattern'].dropna()
-    
-    counter = Counter(valid_patterns)
-    top_patterns = counter.most_common(top_n)
-    
-    print(f"\nTop {top_n} 4-bar patterns (readable):")
-    for class_id, count in top_patterns:
-        idx = valid_patterns[valid_patterns == class_id].index[0]
-        bits = valid_defs.loc[idx]
-        readable = format_pattern_readable(bits)
-        print(f"Class ID: {class_id}, Occurrences: {count}, Definition: {readable}")
+def add_forward_returns(df, horizons=[6,12,18,24]):
+    for h in horizons:
+        df[f'return_{h}b'] = (df['close'].shift(-h) - df['close']) / df['close'] * 100
+    return df
 
 # -----------------------------
-# Run symbol sequentially to save RAM
+# Process a symbol: fetch, classify, returns
 # -----------------------------
-async def process_symbol(symbol, interval='1h', years=4):
-    print(f"\nFetching {symbol}...")
+async def process_symbol(symbol, interval='1h', years=4, horizons=[6,12,18,24]):
     df = await get_historical_ohlc(symbol, interval, years)
-    print(f"{symbol} data fetched: {df.shape[0]} rows")
-    
     df_classed = get_4bar_adjacent_class(df)
+    df_classed = add_forward_returns(df_classed, horizons)
     
-    # Save to CSV immediately
-    csv_filename = f"{symbol}_ohlc.csv"
-    df_classed.to_csv(csv_filename, index=False)
-    print(f"{symbol} data saved to {csv_filename}")
-    
-    # Print top patterns
-    print_top_patterns_readable(df_classed, top_n=10)
+    # Drop rows with missing 4bar_class or returns
+    valid = df_classed.dropna(subset=['4bar_class'] + [f'return_{h}b' for h in horizons])
+    valid['4bar_class'] = valid['4bar_class'].astype(int)
+    return valid
 
 # -----------------------------
-# Main entry
+# Aggregate across symbols
+# -----------------------------
+async def main(symbols, interval='1h', years=4, horizons=[6,12,18,24]):
+    aggregated = pd.DataFrame()
+
+    for symbol in symbols:
+        df_symbol = await process_symbol(symbol, interval, years, horizons)
+        aggregated = pd.concat([aggregated, df_symbol], ignore_index=True)
+
+    # Group by 4bar_class
+    agg_funcs = {}
+    for h in horizons:
+        agg_funcs[f'return_{h}b'] = 'mean'
+        agg_funcs[f'pf_{h}b'] = lambda x: x[x>0].sum() / abs(x[x<0].sum()) if abs(x[x<0].sum())>0 else float('inf')
+
+    # Compute profit factor for each horizon
+    pf_df = pd.DataFrame()
+    for h in horizons:
+        pf = aggregated.groupby('4bar_class')[f'return_{h}b'].apply(lambda x: x[x>0].sum() / abs(x[x<0].sum()) if abs(x[x<0].sum())>0 else float('inf'))
+        pf_df[f'pf_{h}b'] = pf
+
+    # Compute average returns
+    returns_df = aggregated.groupby('4bar_class')[[f'return_{h}b' for h in horizons]].mean()
+
+    # Merge returns and profit factor
+    result = returns_df.merge(pf_df, left_index=True, right_index=True).reset_index()
+
+    # Add human-readable pattern (first occurrence)
+    pattern_map = aggregated.groupby('4bar_class')['pattern_bits'].first().apply(bits_to_readable)
+    result['pattern'] = result['4bar_class'].map(pattern_map)
+
+    # Save CSV
+    result.to_csv("4bar_class_returns_pf.csv", index=False)
+    print("\nCSV saved as 4bar_class_returns_pf.csv")
+    print(result.head(10))
+
+# -----------------------------
+# Run script
 # -----------------------------
 if __name__ == "__main__":
     symbols = ['BTCUSDT','ETHUSDT','BNBUSDT']
-    for symbol in symbols:
-        asyncio.run(process_symbol(symbol, interval='1h', years=4))
+    asyncio.run(main(symbols))
